@@ -1,0 +1,20 @@
+[project]
+name = "kb-web-cli"
+version = "0.1.0"
+description = "Standalone CLI client for the Knowledge Base Web Importer LIVE server."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "typer>=0.9.0",
+    "httpx>=0.24.0",
+    "click>=8.0.0",
+]
+
+[project.scripts]
+kb-cli = "kb_web_cli.main:app"
+kb-web-cli = "kb_web_cli.main:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
