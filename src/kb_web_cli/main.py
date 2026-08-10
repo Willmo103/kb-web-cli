@@ -90,7 +90,7 @@ def client_import(
 
     typer.echo(f"Submitting URL '{url}' for processing...")
     try:
-        with httpx.Client(timeout=120.0) as client:
+        with httpx.Client(timeout=300.0) as client:
             res = client.post(
                 f"{cfg['server_url']}/api/cli/import/url",
                 headers={"X-API-Key": cfg["api_key"]},
@@ -163,7 +163,7 @@ def client_action(
 
     typer.echo(f"Triggering action '{action}' for URL '{url}'...")
     try:
-        with httpx.Client(timeout=120.0) as client:
+        with httpx.Client(timeout=300.0) as client:
             res = client.post(
                 f"{cfg['server_url']}/api/cli/pages/action",
                 headers={"X-API-Key": cfg["api_key"]},
@@ -317,7 +317,7 @@ def client_query(
 
     typer.echo("Querying Knowledge Base RAG agent...")
     try:
-        with httpx.Client(timeout=60.0) as client:
+        with httpx.Client(timeout=180.0) as client:
             res = client.post(
                 f"{cfg['server_url']}/api/cli/agent/query",
                 headers={"X-API-Key": cfg["api_key"]},
@@ -343,5 +343,60 @@ def client_query(
         typer.secho(f"Network error: {str(e)}", fg=typer.colors.RED, bold=True, err=True)
 
 
+@app.command("logs")
+def client_logs(
+    limit: Optional[int] = typer.Option(None, "--limit", "-n", help="Number of log lines to retrieve.")
+):
+    """Displays server system logs (most recent first)."""
+    cfg = load_client_config()
+
+    if limit is None:
+        limit = cfg.get("log_limit", 100)
+    else:
+        cfg["log_limit"] = limit
+        config_file = Path.home() / ".kb" / "cli-config.json"
+        try:
+            with open(config_file, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, indent=4)
+        except Exception:
+            pass
+
+    try:
+        with httpx.Client(timeout=30.0) as client:
+            res = client.get(
+                f"{cfg['server_url']}/api/cli/logs",
+                headers={"X-API-Key": cfg["api_key"]},
+                params={"limit": limit},
+            )
+        if res.status_code == 200:
+            logs = res.json()
+            if not logs:
+                typer.echo("No logs found.")
+                return
+
+            typer.secho(f"\n--- Server Logs (Last {len(logs)} lines) ---", bold=True)
+            for log in logs:
+                ts = log.get("timestamp", "")
+                lvl = log.get("level", "INFO")
+                mod = log.get("module", "root")
+                msg = log.get("message", "")
+                tb = log.get("traceback", "")
+
+                line = f"[{ts}] {lvl} in {mod}: {msg}"
+                if lvl == "ERROR":
+                    typer.secho(line, fg=typer.colors.RED, bold=True)
+                elif lvl == "WARNING":
+                    typer.secho(line, fg=typer.colors.YELLOW)
+                else:
+                    typer.echo(line)
+                if tb:
+                    typer.echo(tb)
+        else:
+            typer.secho(f"Error {res.status_code}: {res.text}", fg=typer.colors.RED, bold=True, err=True)
+    except Exception as e:
+        typer.secho(f"Network error: {str(e)}", fg=typer.colors.RED, bold=True, err=True)
+
+
 if __name__ == "__main__":
     app()
+
