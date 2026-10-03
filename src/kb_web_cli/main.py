@@ -648,7 +648,87 @@ def workspace_terminal_agent(
             typer.secho(f"Network error during agent execution: {str(e)}", fg=typer.colors.RED, bold=True)
 
 
+rag_app = typer.Typer(
+    help="Autonomous Agentic RAG multi-sub-agent report generator with tev1 decision gating.",
+    no_args_is_help=True,
+)
+app.add_typer(rag_app, name="rag")
+
+
+@rag_app.command("report")
+def generate_rag_report(
+    query: str = typer.Argument(..., help="Research question or topic to synthesize"),
+    purpose: str = typer.Option("", "--purpose", "-p", help="Optional research goal or technical focus"),
+    output: Optional[Path] = typer.Option(None, "--output", "-o", help="Optional path to save generated markdown report"),
+    model: Optional[str] = typer.Option(None, "--model", "-m", help="Synthesis model override"),
+    save_to_notes: bool = typer.Option(False, "--save-notes", "-s", help="Automatically save synthesized report to Knowledge Base notes"),
+):
+    """Executes multi-sub-agent retrieval (tag, vector, text) and tev1 decision scoring to synthesize a publication-grade Markdown research report."""
+    cfg = load_client_config()
+    server_url = cfg["server_url"].rstrip("/")
+
+    typer.secho("=" * 60, fg=typer.colors.CYAN)
+    typer.secho("🔬 kb-web Agentic RAG Report Generator", fg=typer.colors.CYAN, bold=True)
+    typer.echo(f"Query: {query}")
+    if purpose:
+        typer.echo(f"Purpose: {purpose}")
+    typer.secho("=" * 60, fg=typer.colors.CYAN)
+
+    typer.secho("Deploying retrieval sub-agents & evaluating candidates with tev1...", fg=typer.colors.MAGENTA)
+
+    try:
+        with httpx.Client(timeout=300.0) as client:
+            res = client.post(
+                f"{server_url}/api/reports/rag/generate",
+                headers={"X-API-Key": cfg["api_key"]},
+                json={
+                    "query": query,
+                    "purpose": purpose,
+                    "synthesis_model": model,
+                },
+            )
+        if res.status_code != 200:
+            typer.secho(f"RAG Generation Error (HTTP {res.status_code}): {res.text}", fg=typer.colors.RED, bold=True, err=True)
+            raise typer.Exit(code=1)
+
+        data = res.json()
+        metrics = data.get("subagent_metrics", {})
+        typer.secho(
+            f"✅ Sub-Agent Retrieval: Tag: {metrics.get('tag_hits', 0)} | Vector: {metrics.get('vector_hits', 0)} | Text: {metrics.get('text_hits', 0)} | Total Candidates: {metrics.get('total_candidates', 0)}",
+            fg=typer.colors.GREEN,
+        )
+        sources = data.get("sources", [])
+        typer.secho(f"⚡ tev1 Decision Gating: Selected {len(sources)} vetted primary evidence sources.", fg=typer.colors.BLUE)
+
+        for s in sources:
+            typer.echo(f"  - [{s.get('tev1_score', 'N/A')}%] {s.get('title')} ({', '.join(s.get('match_types', []))})")
+
+        report_md = data.get("report_markdown", "")
+        typer.echo("\n" + "=" * 60)
+        typer.echo(report_md)
+        typer.echo("=" * 60 + "\n")
+
+        if output:
+            output.write_text(report_md, encoding="utf-8")
+            typer.secho(f"📁 Report saved to: {output.resolve()}", fg=typer.colors.GREEN, bold=True)
+
+        if save_to_notes and data.get("id"):
+            with httpx.Client(timeout=15.0) as client:
+                save_res = client.post(
+                    f"{server_url}/api/reports/rag/{data['id']}/save-to-notes",
+                    headers={"X-API-Key": cfg["api_key"]},
+                )
+            if save_res.status_code == 200:
+                note_info = save_res.json()
+                typer.secho(f"💾 Saved to Knowledge Base Notes: {note_info.get('note_url')}", fg=typer.colors.GREEN)
+
+    except Exception as e:
+        typer.secho(f"Network error during RAG report generation: {str(e)}", fg=typer.colors.RED, bold=True, err=True)
+        raise typer.Exit(code=1)
+
+
 if __name__ == "__main__":
     app()
+
 
 
