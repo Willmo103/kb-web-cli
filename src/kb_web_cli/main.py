@@ -727,8 +727,180 @@ def generate_rag_report(
         raise typer.Exit(code=1)
 
 
+
+error_app = typer.Typer(
+    help="Inspect, search, and diagnose server error incidents and review Maintenance Agent feedback.",
+    no_args_is_help=True,
+)
+app.add_typer(error_app, name="error")
+
+
+@error_app.command("list")
+def list_errors_cli(
+    limit: int = typer.Option(25, "--limit", "-n", help="Maximum number of errors to return"),
+    status: Optional[str] = typer.Option(None, "--status", "-s", help="Filter by status (open, analyzed)"),
+):
+    """Lists recent server error incidents recorded in the server database."""
+    cfg = load_client_config()
+    server_url = cfg["server_url"].rstrip("/")
+
+    params = {"limit": limit}
+    if status:
+        params["status"] = status
+
+    try:
+        with httpx.Client(timeout=15.0) as client:
+            res = client.get(
+                f"{server_url}/api/errors",
+                headers={"X-API-Key": cfg["api_key"]},
+                params=params,
+            )
+        if res.status_code == 200:
+            data = res.json()
+            items = data.get("items", [])
+            total = data.get("total", 0)
+            typer.secho(f"\n--- Server Error Incidents (Total: {total}) ---", bold=True)
+            if not items:
+                typer.secho("✅ No error incidents found.", fg=typer.colors.GREEN)
+                return
+
+            header = f"{'ID':<6} {'Timestamp':<20} {'Status':<10} {'Error Type':<25} {'Endpoint'}"
+            typer.echo(header)
+            typer.echo("-" * 80)
+            for it in items:
+                eid = it.get("id")
+                ts = it.get("timestamp", "")[:19].replace("T", " ")
+                st = it.get("status", "open")
+                etype = it.get("error_type", "Unknown")[:24]
+                req = f"{it.get('request_method', '')} {it.get('request_url', '')}"[:35]
+                st_color = typer.colors.GREEN if st == "analyzed" else typer.colors.YELLOW
+                typer.echo(f"{eid:<6} {ts:<20} ", nl=False)
+                typer.secho(f"{st:<10}", fg=st_color, nl=False)
+                typer.echo(f" {etype:<25} {req}")
+            typer.echo("")
+        else:
+            typer.secho(f"Error {res.status_code}: {res.text}", fg=typer.colors.RED, bold=True, err=True)
+    except Exception as e:
+        typer.secho(f"Network error: {str(e)}", fg=typer.colors.RED, bold=True, err=True)
+
+
+@error_app.command("view")
+def view_error_cli(
+    error_id: int = typer.Argument(..., help="Server Error Incident ID to inspect"),
+):
+    """Views full stack trace and Maintenance Agent diagnostic feedback for an error incident."""
+    cfg = load_client_config()
+    server_url = cfg["server_url"].rstrip("/")
+
+    try:
+        with httpx.Client(timeout=15.0) as client:
+            res = client.get(
+                f"{server_url}/api/errors/{error_id}",
+                headers={"X-API-Key": cfg["api_key"]},
+            )
+        if res.status_code == 200:
+            err = res.json()
+            typer.secho("\n" + "=" * 70, fg=typer.colors.RED)
+            typer.secho(f"🚨 Server Error Incident #{err.get('id')} - {err.get('error_type')}", fg=typer.colors.RED, bold=True)
+            typer.secho("=" * 70, fg=typer.colors.RED)
+            typer.echo(f"Timestamp:      {err.get('timestamp')}")
+            typer.echo(f"Request:        {err.get('request_method')} {err.get('request_url')}")
+            typer.echo(f"Client IP:      {err.get('client_ip')}")
+            typer.echo(f"Status:         {err.get('status')}")
+            typer.echo(f"Error Message:  {err.get('error_message')}")
+            typer.echo("\n--- Stack Trace ---")
+            typer.secho(err.get("stack_trace", "No stack trace recorded."), fg=typer.colors.YELLOW)
+
+            feedback = err.get("agent_feedback")
+            if feedback:
+                typer.secho("\n--- 🤖 Maintenance Agent Diagnostic Feedback ---", fg=typer.colors.CYAN, bold=True)
+                typer.echo(feedback)
+            else:
+                typer.secho("\n[INFO] No agent diagnosis generated yet. Run 'kb-web-cli error analyze <id>' to trigger analysis.", fg=typer.colors.YELLOW)
+            typer.echo("")
+        else:
+            typer.secho(f"Error {res.status_code}: {res.text}", fg=typer.colors.RED, bold=True, err=True)
+    except Exception as e:
+        typer.secho(f"Network error: {str(e)}", fg=typer.colors.RED, bold=True, err=True)
+
+
+@error_app.command("search")
+def search_errors_cli(
+    query: str = typer.Argument(..., help="Search query string"),
+    limit: int = typer.Option(20, "--limit", "-n", help="Maximum results to return"),
+):
+    """Searches historical server error incidents by error message, type, or stack trace keywords."""
+    cfg = load_client_config()
+    server_url = cfg["server_url"].rstrip("/")
+
+    try:
+        with httpx.Client(timeout=15.0) as client:
+            res = client.get(
+                f"{server_url}/api/errors/search",
+                headers={"X-API-Key": cfg["api_key"]},
+                params={"q": query, "limit": limit},
+            )
+        if res.status_code == 200:
+            data = res.json()
+            items = data.get("items", [])
+            typer.secho(f"\n--- Error Search Results for '{query}' ({data.get('count', 0)} matches) ---", bold=True)
+            if not items:
+                typer.echo("No matching errors found.")
+                return
+
+            for it in items:
+                fb_icon = "🤖" if it.get("has_feedback") else " "
+                typer.echo(f"  [#{it.get('id')}] {it.get('timestamp', '')[:19]} | {it.get('error_type')} | {it.get('error_message', '')[:70]} {fb_icon}")
+            typer.echo("")
+        else:
+            typer.secho(f"Error {res.status_code}: {res.text}", fg=typer.colors.RED, bold=True, err=True)
+    except Exception as e:
+        typer.secho(f"Network error: {str(e)}", fg=typer.colors.RED, bold=True, err=True)
+
+
+@error_app.command("analyze")
+def analyze_error_cli(
+    error_id: int = typer.Argument(..., help="Incident ID to trigger Maintenance Agent analysis for"),
+):
+    """Manually triggers the Maintenance Agent sidecar to inspect source code and diagnose an error."""
+    cfg = load_client_config()
+    server_url = cfg["server_url"].rstrip("/")
+
+    typer.echo(f"Dispatching error #{error_id} to Maintenance Agent...")
+    try:
+        with httpx.Client(timeout=30.0) as client:
+            res = client.post(
+                f"{server_url}/api/errors/{error_id}/analyze",
+                headers={"X-API-Key": cfg["api_key"]},
+            )
+        if res.status_code == 200:
+            data = res.json()
+            typer.secho(f"\n--- 🤖 Maintenance Agent Diagnosis for #{error_id} ---", fg=typer.colors.CYAN, bold=True)
+            typer.echo(data.get("agent_feedback", "No feedback produced."))
+            typer.echo("")
+        else:
+            typer.secho(f"Error {res.status_code}: {res.text}", fg=typer.colors.RED, bold=True, err=True)
+    except Exception as e:
+        typer.secho(f"Network error: {str(e)}", fg=typer.colors.RED, bold=True, err=True)
+
+
+@app.command("maintenance-daemon")
+def run_maintenance_daemon_cli(
+    interval: int = typer.Option(5, "--interval", "-i", help="Polling interval in seconds"),
+    run_once: bool = typer.Option(False, "--once", help="Process pending errors once and exit"),
+):
+    """Runs the background sidecar Maintenance Agent daemon monitoring for uncaught errors."""
+    try:
+        from kb_web.maintenance_agent import run_maintenance_daemon
+        run_maintenance_daemon(poll_interval=interval, run_once=run_once)
+    except ImportError:
+        typer.secho("Error: kb_web core package not found in Python path.", fg=typer.colors.RED, bold=True, err=True)
+        raise typer.Exit(code=1)
+
+
 if __name__ == "__main__":
     app()
+
 
 
 
