@@ -113,6 +113,51 @@ def client_import(
         typer.secho(f"Network/Server timeout error: {str(e)}", fg=typer.colors.RED, bold=True, err=True)
 
 
+@app.command("import-repo")
+def client_import_repo(
+    repo_url: str = typer.Argument(..., help="Git repository URL to clone and ingest (e.g. https://github.com/owner/repo.git)."),
+    depth: int = typer.Option(1, "--depth", "-d", help="Commit depth for shallow clone."),
+    collection_id: Optional[int] = typer.Option(None, "--collection", "-c", help="Optional collection ID to assign."),
+    match: Optional[str] = typer.Option(None, "--match", "-m", help="Comma-separated glob patterns to include (e.g. '*.py,*.ts')."),
+    exclude: Optional[str] = typer.Option(None, "--exclude", "-e", help="Comma-separated glob patterns to exclude (e.g. 'tests/*')."),
+):
+    """Clones a Git repository, synthesizes its structured markdown representation using devtul's rpr engine, and ingests it into the server RAG pipeline."""
+    cfg = load_client_config()
+    server_url = cfg["server_url"].rstrip("/")
+
+    match_list = [s.strip() for s in match.split(",") if s.strip()] if match else []
+    exclude_list = [s.strip() for s in exclude.split(",") if s.strip()] if exclude else []
+
+    typer.echo(f"Cloning and importing repository '{repo_url}' into Knowledge Base...")
+    try:
+        with httpx.Client(timeout=300.0) as client:
+            res = client.post(
+                f"{server_url}/api/import/repo",
+                headers={"X-API-Key": cfg["api_key"]},
+                json={
+                    "repo_url": repo_url,
+                    "depth": depth,
+                    "collection_id": collection_id,
+                    "match": match_list,
+                    "exclude": exclude_list,
+                },
+            )
+        if res.status_code == 200:
+            data = res.json()
+            if data.get("status") == "success":
+                typer.secho(f"Success: {data.get('title')}", fg=typer.colors.GREEN, bold=True)
+                typer.echo(f"URL: {data.get('url')}")
+                typer.echo(f"Description: {data.get('description')}")
+                typer.echo(f"Tags: {data.get('tags')}")
+                typer.echo(f"View Profile: {server_url}{data.get('view_url')}")
+            else:
+                typer.secho(f"Error: {data.get('detail') or data.get('message')}", fg=typer.colors.RED, bold=True, err=True)
+        else:
+            typer.secho(f"Error {res.status_code}: {res.text}", fg=typer.colors.RED, bold=True, err=True)
+    except Exception as e:
+        typer.secho(f"Network error: {str(e)}", fg=typer.colors.RED, bold=True, err=True)
+
+
 @app.command("list")
 def client_list(
     limit: int = typer.Option(10, "--limit", "-n", help="Number of items to retrieve."),
