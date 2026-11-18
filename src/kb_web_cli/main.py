@@ -943,6 +943,237 @@ def run_maintenance_daemon_cli(
         raise typer.Exit(code=1)
 
 
+def save_client_config(cfg: dict) -> None:
+    config_dir = Path.home() / ".kb"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    config_file = config_dir / "cli-config.json"
+    with open(config_file, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=4)
+
+
+@app.command("status")
+def client_status():
+    """Verifies connectivity and API key authentication against the running kb-web server."""
+    cfg = load_client_config()
+    server_url = cfg["server_url"].rstrip("/")
+    try:
+        with httpx.Client(timeout=10.0) as client:
+            h_res = client.get(f"{server_url}/api/health")
+            a_res = client.get(
+                f"{server_url}/api/cli/obsidian/config",
+                headers={"X-API-Key": cfg["api_key"]},
+            )
+        if h_res.status_code == 200 and a_res.status_code == 200:
+            typer.secho(f"Connected to {server_url} (authenticated).", fg=typer.colors.GREEN, bold=True)
+        elif h_res.status_code == 200:
+            typer.secho(f"Server reachable at {server_url}, but auth failed ({a_res.status_code}).", fg=typer.colors.RED, err=True)
+            raise typer.Exit(code=1)
+        else:
+            typer.secho(f"Server returned status {h_res.status_code}.", fg=typer.colors.RED, err=True)
+            raise typer.Exit(code=1)
+    except Exception as e:
+        typer.secho(f"Connection failed: {e}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
+
+obsidian_app = typer.Typer(
+    help="Obsidian vault export sync and path configuration.",
+    no_args_is_help=True,
+)
+app.add_typer(obsidian_app, name="obsidian")
+
+
+@obsidian_app.command("config")
+def obsidian_config_cmd(
+    vault: Optional[str] = typer.Option(None, "--vault", "-v", help="Local root directory of the Obsidian vault."),
+    sources_dir: Optional[str] = typer.Option(None, "--sources-dir", "-s", help="Subpath inside vault for _sources (default: _sources)."),
+    articles_dir: Optional[str] = typer.Option(None, "--articles-dir", "-a", help="Subpath inside vault for articles (default: reference/articles)."),
+):
+    """Configures Obsidian vault location and subpaths locally and on the running server."""
+    cfg = load_client_config()
+    server_url = cfg["server_url"].rstrip("/")
+    headers = {"X-API-Key": cfg["api_key"]}
+
+    has_updates = any(x is not None for x in (vault, sources_dir, articles_dir))
+    try:
+        with httpx.Client(timeout=15.0) as client:
+            if has_updates:
+                payload = {}
+                if vault is not None:
+                    payload["vault_path"] = str(Path(vault).expanduser().resolve()) if vault.strip() else ""
+                    cfg["obsidian_vault_path"] = payload["vault_path"]
+                if sources_dir is not None:
+                    payload["sources_subpath"] = sources_dir.strip().strip("/") or "_sources"
+                    cfg["obsidian_sources_subpath"] = payload["sources_subpath"]
+                if articles_dir is not None:
+                    payload["articles_subpath"] = articles_dir.strip().strip("/") or "reference/articles"
+                    cfg["obsidian_articles_subpath"] = payload["articles_subpath"]
+
+                res = client.post(f"{server_url}/api/cli/obsidian/config", headers=headers, json=payload)
+                if res.status_code != 200:
+                    typer.secho(f"Server error {res.status_code}: {res.text}", fg=typer.colors.RED, err=True)
+                    raise typer.Exit(code=1)
+                save_client_config(cfg)
+                data = res.json()
+                typer.secho("Obsidian vault configuration updated locally and on server:", fg=typer.colors.GREEN, bold=True)
+            else:
+                res = client.get(f"{server_url}/api/cli/obsidian/config", headers=headers)
+                if res.status_code != 200:
+                    typer.secho(f"Server error {res.status_code}: {res.text}", fg=typer.colors.RED, err=True)
+                    raise typer.Exit(code=1)
+                data = res.json()
+                typer.secho("Current Obsidian Vault Configuration:", fg=typer.colors.CYAN, bold=True)
+
+            typer.echo(f"  Vault Path:       {data.get('vault_path') or cfg.get('obsidian_vault_path') or '(not set)'}")
+            typer.echo(f"  Sources Subpath:  {data.get('sources_subpath', '_sources')}")
+            typer.echo(f"  Articles Subpath: {data.get('articles_subpath', 'reference/articles')}")
+    except typer.Exit:
+        raise
+    except Exception as e:
+        typer.secho(f"Network error: {e}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
+
+@obsidian_app.command("sync")
+def obsidian_sync_cmd(
+    vault: Optional[str] = typer.Option(None, "--vault", "-v", help="Override target Obsidian vault directory."),
+    sources_dir: Optional[str] = typer.Option(None, "--sources-dir", "-s", help="Override _sources subpath inside vault."),
+    articles_dir: Optional[str] = typer.Option(None, "--articles-dir", "-a", help="Override articles subpath inside vault."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Preview file changes without writing to disk."),
+    delete_stale: bool = typer.Option(False, "--delete-stale", help="Delete .md files in target subpaths no longer present in export."),
+):
+    """Fetches a fresh Obsidian vault ZIP export from the server and syncs changed files into the vault."""
+    import hashlib
+    import io
+    import zipfile
+
+    cfg = load_client_config()
+    server_url = cfg["server_url"].rstrip("/")
+    headers = {"X-API-Key": cfg["api_key"]}
+
+    try:
+        with httpx.Client(timeout=120.0) as client:
+            # 1. Sync config updates to server if CLI overrides were passed
+            updates = {}
+            if vault is not None:
+                updates["vault_path"] = str(Path(vault).expanduser().resolve())
+                cfg["obsidian_vault_path"] = updates["vault_path"]
+            if sources_dir is not None:
+                updates["sources_subpath"] = sources_dir.strip().strip("/") or "_sources"
+                cfg["obsidian_sources_subpath"] = updates["sources_subpath"]
+            if articles_dir is not None:
+                updates["articles_subpath"] = articles_dir.strip().strip("/") or "reference/articles"
+                cfg["obsidian_articles_subpath"] = updates["articles_subpath"]
+
+            if updates:
+                cfg_res = client.post(f"{server_url}/api/cli/obsidian/config", headers=headers, json=updates)
+                if cfg_res.status_code != 200:
+                    typer.secho(f"Failed updating server config ({cfg_res.status_code}): {cfg_res.text}", fg=typer.colors.RED, err=True)
+                    raise typer.Exit(code=1)
+                save_client_config(cfg)
+                srv_cfg = cfg_res.json()
+            else:
+                cfg_res = client.get(f"{server_url}/api/cli/obsidian/config", headers=headers)
+                if cfg_res.status_code != 200:
+                    typer.secho(f"Failed fetching server config ({cfg_res.status_code}): {cfg_res.text}", fg=typer.colors.RED, err=True)
+                    raise typer.Exit(code=1)
+                srv_cfg = cfg_res.json()
+
+            vault_str = (vault or srv_cfg.get("vault_path") or cfg.get("obsidian_vault_path") or "").strip()
+            if not vault_str:
+                typer.secho(
+                    "Error: No Obsidian vault path configured. Pass --vault <path> or run 'kb-cli obsidian config --vault <path>'.",
+                    fg=typer.colors.RED,
+                    err=True,
+                )
+                raise typer.Exit(code=1)
+
+            vault_root = Path(vault_str).expanduser().resolve()
+            sources_sub = (sources_dir or srv_cfg.get("sources_subpath") or cfg.get("obsidian_sources_subpath") or "_sources").strip("/")
+            articles_sub = (articles_dir or srv_cfg.get("articles_subpath") or cfg.get("obsidian_articles_subpath") or "reference/articles").strip("/")
+
+            typer.echo(f"Fetching fresh Obsidian vault export from {server_url}...")
+            exp_res = client.get(f"{server_url}/api/cli/export/obsidian", headers=headers)
+            if exp_res.status_code != 200:
+                typer.secho(f"Export download failed ({exp_res.status_code}): {exp_res.text}", fg=typer.colors.RED, err=True)
+                raise typer.Exit(code=1)
+            zip_bytes = exp_res.content
+    except typer.Exit:
+        raise
+    except Exception as e:
+        typer.secho(f"Network error: {e}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
+    sources_root = (vault_root / sources_sub).resolve()
+    articles_root = (vault_root / articles_sub).resolve()
+
+    added = 0
+    updated = 0
+    unchanged = 0
+    deleted = 0
+    synced_targets = set()
+
+    with zipfile.ZipFile(io.BytesIO(zip_bytes), "r") as zf:
+        for member in zf.infolist():
+            if member.is_dir():
+                continue
+            rel = member.filename.replace("\\", "/").lstrip("/")
+            if rel.startswith("_sources/"):
+                sub_rel = rel[len("_sources/"):]
+                base_dir = sources_root
+            elif rel.startswith("articles/"):
+                sub_rel = rel[len("articles/"):]
+                base_dir = articles_root
+            else:
+                continue
+
+            if not sub_rel:
+                continue
+
+            dest = (base_dir / sub_rel).resolve()
+            # ZipSlip path traversal guard
+            if not str(dest).startswith(str(base_dir)):
+                continue
+
+            synced_targets.add(dest)
+            incoming_bytes = zf.read(member)
+            incoming_hash = hashlib.sha256(incoming_bytes).hexdigest()
+
+            if dest.exists():
+                existing_hash = hashlib.sha256(dest.read_bytes()).hexdigest()
+                if existing_hash == incoming_hash:
+                    unchanged += 1
+                    continue
+                updated += 1
+            else:
+                added += 1
+
+            if not dry_run:
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_bytes(incoming_bytes)
+
+    if delete_stale:
+        for base_dir in (sources_root, articles_root):
+            if base_dir.exists():
+                for existing_file in base_dir.rglob("*.md"):
+                    resolved_existing = existing_file.resolve()
+                    if resolved_existing not in synced_targets:
+                        deleted += 1
+                        if not dry_run:
+                            existing_file.unlink()
+
+    mode_tag = " [DRY RUN]" if dry_run else ""
+    typer.secho(f"Obsidian Vault Sync Complete{mode_tag}:", fg=typer.colors.GREEN, bold=True)
+    typer.echo(f"  Vault:     {vault_root}")
+    typer.echo(f"  Sources:   /{sources_sub}")
+    typer.echo(f"  Articles:  /{articles_sub}")
+    typer.echo(f"  Added:     {added}")
+    typer.echo(f"  Updated:   {updated}")
+    typer.echo(f"  Unchanged: {unchanged}")
+    if delete_stale:
+        typer.echo(f"  Deleted:   {deleted}")
+
+
 if __name__ == "__main__":
     app()
 
